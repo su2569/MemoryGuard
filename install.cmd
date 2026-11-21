@@ -7,7 +7,7 @@ set "DST=%DIR%\MemoryGuardService.exe"
 
 if not exist "%SRC%" (
   echo missing build: %SRC%
-  echo build it first: g++ MemoryGuardService.cpp -o MemoryGuardService.exe -std=c++17 -O2 -municode -g3 -lwtsapi32 -ladvapi32 -luser32 -lpsapi -lwintrust -lcrypt32
+  echo build it first: g++ MemoryGuardService.cpp -o MemoryGuardService.exe -std=c++17 -O2 -municode -g3 -static -static-libgcc -static-libstdc++ -lwtsapi32 -ladvapi32 -luser32 -lpsapi -lwintrust -lcrypt32
   exit /b 1
 )
 if not exist "%DIR%" mkdir "%DIR%"

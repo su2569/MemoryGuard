@@ -26,10 +26,10 @@ MemoryGuard 补上了这块拼图：
 - **黑白名单可配**：`guard.ini` 里按 exe 名或目录前缀配置，白名单永不动、黑名单优先击杀
 - **服务化**：SCM 标准服务，开机自启，`sc` 全套管理
 ## 构建
-需 MinGW-w64（g++）：
+需 MinGW-w64（g++）。**必须静态链接**：服务环境没有 MinGW 运行时 DLL，动态链接会启动失败（1053 / 未及时响应）。
 ```bash
 g++ MemoryGuardService.cpp -o MemoryGuardService.exe \
-    -std=c++17 -O2 -municode -g3 \
+    -std=c++17 -O2 -municode -g3 -static -static-libgcc -static-libstdc++ \
     -lwtsapi32 -ladvapi32 -luser32 -lpsapi -lwintrust -lcrypt32
 ```
 ## 部署（管理员 CMD）
