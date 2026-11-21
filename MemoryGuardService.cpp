@@ -3,7 +3,7 @@
 //
 // 编译（w64devkit / GCC 15）：
 //   g++ MemoryGuardService.cpp -o MemoryGuardService.exe -std=c++17 -O2 \
-//       -municode -g3 -lwtsapi32 -ladvapi32 -luser32 -lpsapi
+//       -municode -g3 -lwtsapi32 -ladvapi32 -luser32 -lpsapi -lwintrust -lcrypt32
 //
 // 用法：
 //   MemoryGuardService.exe               以服务方式运行（由 SCM 启动）
@@ -20,9 +20,12 @@
 #include <tlhelp32.h>
 #include <psapi.h>
 #include <wtsapi32.h>
+#include <wintrust.h>
+#include <softpub.h>
 
 #include <string>
 #include <vector>
+#include <map>
 #include <algorithm>
 #include <cwctype>
 #include <cstdio>
@@ -56,6 +59,24 @@ static struct {
 } g_oomcfg;
 
 static volatile LONG g_stop = 0;
+
+// 安全软件保护：注册进系统的"带签名 + 管理员及以上"进程默认不碰（连温和回收都不做）。
+// 完整性级别取值：0=Medium 1=High(Administrator) 2=System；默认按 System 起保护。
+static struct {
+    int enabled          = 1;   // 0 = 关闭整块保护
+    int min_level        = 2;   // 0=medium 1=admin 2=system
+    int require_signature = 1;  // 必须能验签通过
+    int require_system_dir = 1; // exe 必须在系统目录（WinDir / Program Files* / ProgramData）
+} g_protect;
+
+static std::vector<std::wstring> g_protectDirs;   // 小写、带结尾反斜杠
+static std::vector<std::wstring> g_whitelist;     // ini [lists] whitelist
+static std::vector<std::wstring> g_blacklist;     // ini [lists] blacklist
+
+// 定义在「安全软件保护」一节，LoadConfig 先用
+static void BuildProtectDirs();
+static void ParseList(const wchar_t* section, const wchar_t* key,
+                      std::vector<std::wstring>* out);
 
 // ============================ 基础工具 ============================
 
@@ -125,7 +146,7 @@ static bool IniFileExists() {
 
 // 首次运行自动生成默认配置（内容取自当前内置默认值）
 static void WriteDefaultIni() {
-    char buf[2048];
+    char buf[4096];
     int n = sprintf(buf,
         "; MemoryGuard config (guard.ini)\r\n"
         "; Edit this file, then restart: sc stop MemoryGuard && sc start MemoryGuard\r\n"
@@ -147,11 +168,30 @@ static void WriteDefaultIni() {
         "group_kill = %d\r\n"
         "panic_on_oom = %d      ; 0=off 1=service exit 2=reboot\r\n"
         "respawn_adj = %d\r\n"
-        "victim_wait_ms = %lu\r\n",
+        "victim_wait_ms = %lu\r\n"
+        "\r\n"
+        "; Security software protection: never touch (not even EmptyWorkingSet)\r\n"
+        "; processes whose exe is signed AND lives under a system dir AND runs at\r\n"
+        "; or above min_level. Blacklist entries override this protection.\r\n"
+        "[protect]\r\n"
+        "enabled = %d            ; 1=on 0=off\r\n"
+        "min_level = %d          ; 0=medium 1=admin(High) 2=system\r\n"
+        "require_signature = %d\r\n"
+        "require_system_dir = %d ; 1=must be under windir/Program Files*/ProgramData\r\n"
+        "dirs =                  ; extra protected dirs, ';' separated\r\n"
+        "\r\n"
+        "; Names or directory prefixes, ';' separated. A dir entry ends with \\\r\n"
+        "; whitelist: never reclaimed, never killed (adj = -1000)\r\n"
+        "; blacklist: always eligible; overrides [protect]\r\n"
+        "[lists]\r\n"
+        "whitelist =\r\n"
+        "blacklist =\r\n",
         (int)kSoftThreshold, (int)kHardThreshold, (int)(kMinVictimWS >> 20),
         kCheckInterval, kMinProcessAge, (int)(kLogMaxSize >> 20),
         g_oomcfg.dump_tasks, g_oomcfg.sigkill_only, g_oomcfg.group_kill,
-        g_oomcfg.panic_on_oom, g_oomcfg.respawn_adj, g_oomcfg.victim_wait_ms);
+        g_oomcfg.panic_on_oom, g_oomcfg.respawn_adj, g_oomcfg.victim_wait_ms,
+        g_protect.enabled, g_protect.min_level,
+        g_protect.require_signature, g_protect.require_system_dir);
     if (n <= 0) return;
     HANDLE h = CreateFileW(kIniFile, GENERIC_WRITE, 0, nullptr,
                            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -166,6 +206,8 @@ static void WriteDefaultIni() {
 }
 
 static void LoadConfig() {
+    // CLI（--score/--check）不走 RunConsole，数据目录要在这里兜底建
+    CreateNestedDir(kDataDir);
     if (!IniFileExists())
         WriteDefaultIni();   // 不存在则自动创建，然后照常读取（读回来的就是默认值）
 
@@ -193,6 +235,19 @@ static void LoadConfig() {
     g_oomcfg.victim_wait_ms = (DWORD)IniGetInt(L"oom", L"victim_wait_ms",
                                                (int)g_oomcfg.victim_wait_ms);
 
+    // ---- 安全软件保护 ----
+    g_protect.enabled            = IniGetInt(L"protect", L"enabled", g_protect.enabled);
+    g_protect.min_level          = IniGetInt(L"protect", L"min_level", g_protect.min_level);
+    g_protect.require_signature  = IniGetInt(L"protect", L"require_signature", g_protect.require_signature);
+    g_protect.require_system_dir = IniGetInt(L"protect", L"require_system_dir", g_protect.require_system_dir);
+    if (g_protect.min_level < 0) g_protect.min_level = 0;
+    if (g_protect.min_level > 2) g_protect.min_level = 2;
+    BuildProtectDirs();
+
+    // ---- 黑白名单（ini） ----
+    ParseList(L"lists", L"whitelist", &g_whitelist);
+    ParseList(L"lists", L"blacklist", &g_blacklist);
+
     // ---- 合法性钳制 ----
     if (kSoftThreshold < 50) kSoftThreshold = 50;
     if (kHardThreshold > 99) kHardThreshold = 99;
@@ -213,6 +268,11 @@ static void LoadConfig() {
         kCheckInterval, kMinProcessAge,
         g_oomcfg.dump_tasks, g_oomcfg.sigkill_only, g_oomcfg.group_kill,
         g_oomcfg.panic_on_oom, g_oomcfg.respawn_adj, g_oomcfg.victim_wait_ms);
+    Log(L"安全软件保护：%s（min_level=%d sig=%d sysdir=%d dirs=%Iu） 名单：白=%Iu 黑=%Iu",
+        g_protect.enabled ? L"开" : L"关", g_protect.min_level,
+        g_protect.require_signature, g_protect.require_system_dir,
+        (size_t)g_protectDirs.size(), (size_t)g_whitelist.size(),
+        (size_t)g_blacklist.size());
 }
 
 // ============================ 权限 ============================
@@ -229,10 +289,173 @@ static void EnableSeDebug() {
     CloseHandle(tok);
 }
 
+// ============================ 白名单/黑名单（ini 可配） ============================
+
+// "a.exe;b.exe;D:\soft\" → 小写条目。带路径分隔符的按前缀匹配，其余按 exe 名。
+static void ParseList(const wchar_t* section, const wchar_t* key,
+                      std::vector<std::wstring>* out) {
+    wchar_t buf[4096] = L"";
+    GetPrivateProfileStringW(section, key, L"", buf, 4096, kIniFile);
+    out->clear();
+    std::wstring cur;
+    for (const wchar_t* p = buf;; ++p) {
+        if (*p == L';' || *p == L'\0') {
+            size_t b = cur.find_first_not_of(L" \t");
+            size_t e = cur.find_last_not_of(L" \t");
+            if (b != std::wstring::npos) {
+                std::wstring item = Lower(cur.substr(b, e - b + 1));
+                if (!item.empty()) out->push_back(item);
+            }
+            cur.clear();
+            if (*p == L'\0') break;
+        } else {
+            cur.push_back(*p);
+        }
+    }
+}
+
+static bool ListMatches(const std::vector<std::wstring>& list,
+                        const std::wstring& name, const std::wstring& path) {
+    std::wstring n = Lower(name);
+    std::wstring p = Lower(path);
+    for (const auto& item : list) {
+        if (item.find(L'\\') != std::wstring::npos ||
+            item.find(L'/') != std::wstring::npos ||
+            item.find(L':') != std::wstring::npos) {
+            std::wstring prefix = item;
+            if (!prefix.empty() && prefix.back() != L'\\' && prefix.back() != L'/')
+                prefix.push_back(L'\\');
+            if (!p.empty() && p.rfind(prefix, 0) == 0) return true;
+        } else if (n == item) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool IsBlacklisted(const std::wstring& name, const std::wstring& path) {
+    return ListMatches(g_blacklist, name, path);
+}
+
+// ============================ 安全软件保护 ============================
+
+static void BuildProtectDirs() {
+    g_protectDirs.clear();
+    auto addEnv = [](const wchar_t* var) {
+        wchar_t buf[MAX_PATH] = L"";
+        DWORD n = GetEnvironmentVariableW(var, buf, MAX_PATH);
+        if (n > 0 && n < MAX_PATH) {
+            std::wstring d = Lower(buf);
+            if (!d.empty() && d.back() != L'\\') d.push_back(L'\\');
+            g_protectDirs.push_back(d);
+        }
+    };
+    addEnv(L"windir");
+    addEnv(L"ProgramFiles");
+    addEnv(L"ProgramFiles(x86)");
+    addEnv(L"ProgramData");
+
+    // [protect] dirs 追加的目录
+    wchar_t buf[4096] = L"";
+    GetPrivateProfileStringW(L"protect", L"dirs", L"", buf, 4096, kIniFile);
+    std::wstring cur;
+    for (const wchar_t* p = buf;; ++p) {
+        if (*p == L';' || *p == L'\0') {
+            size_t b = cur.find_first_not_of(L" \t");
+            size_t e = cur.find_last_not_of(L" \t");
+            if (b != std::wstring::npos) {
+                std::wstring d = Lower(cur.substr(b, e - b + 1));
+                if (!d.empty() && d.back() != L'\\') d.push_back(L'\\');
+                if (!d.empty()) g_protectDirs.push_back(d);
+            }
+            cur.clear();
+            if (*p == L'\0') break;
+        } else {
+            cur.push_back(*p);
+        }
+    }
+}
+
+static bool IsSystemDir(const std::wstring& path) {
+    std::wstring p = Lower(path);
+    for (const auto& d : g_protectDirs)
+        if (!d.empty() && p.rfind(d, 0) == 0) return true;
+    return false;
+}
+
+// 0=Medium 1=High(Administrator) 2=System；-1 = 读不到
+static int ProcessIntegrityLevel(DWORD pid) {
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!h) return -1;
+    HANDLE tok = nullptr;
+    int level = -1;
+    if (OpenProcessToken(h, TOKEN_QUERY, &tok)) {
+        DWORD len = 0;
+        GetTokenInformation(tok, TokenIntegrityLevel, nullptr, 0, &len);
+        if (len) {
+            std::vector<BYTE> buf(len);
+            if (GetTokenInformation(tok, TokenIntegrityLevel, buf.data(), len, &len)) {
+                auto* tml = (TOKEN_MANDATORY_LABEL*)buf.data();
+                if (tml->Label.Sid && IsValidSid(tml->Label.Sid)) {
+                    DWORD cnt = *GetSidSubAuthorityCount(tml->Label.Sid);
+                    DWORD rid = *GetSidSubAuthority(tml->Label.Sid, cnt - 1);
+                    if (rid >= SECURITY_MANDATORY_SYSTEM_RID) level = 2;
+                    else if (rid >= SECURITY_MANDATORY_HIGH_RID) level = 1;
+                    else if (rid >= SECURITY_MANDATORY_MEDIUM_RID) level = 0;
+                }
+            }
+        }
+        CloseHandle(tok);
+    }
+    CloseHandle(h);
+    return level;
+}
+
+// Authenticode 验签；只用本地缓存，不在服务里联网拉吊销列表。
+static bool IsSignedFile(const std::wstring& path) {
+    static std::map<std::wstring, bool> cache;
+    auto it = cache.find(path);
+    if (it != cache.end()) return it->second;
+
+    WINTRUST_FILE_INFO fi{};
+    fi.cbStruct = sizeof(fi);
+    fi.pcwszFilePath = path.c_str();
+    WINTRUST_DATA wd{};
+    wd.cbStruct = sizeof(wd);
+    wd.dwUIChoice = WTD_UI_NONE;
+    wd.fdwRevocationChecks = WTD_REVOKE_NONE;
+    wd.dwUnionChoice = WTD_CHOICE_FILE;
+    wd.pFile = &fi;
+    wd.dwStateAction = WTD_STATEACTION_VERIFY;
+    wd.dwProvFlags = WTD_SAFER_FLAG | WTD_CACHE_ONLY_URL_RETRIEVAL;
+    GUID action = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+
+    LONG st = WinVerifyTrust(nullptr, &action, &wd);
+    wd.dwStateAction = WTD_STATEACTION_CLOSE;
+    WinVerifyTrust(nullptr, &action, &wd);
+
+    bool ok = (st == ERROR_SUCCESS);
+    cache[path] = ok;
+    return ok;
+}
+
+// 安全软件判定：黑名单优先（想杀就杀），随后要求签名 + 系统目录 + 权限档位全部满足。
+static bool IsProtectedProcess(const std::wstring& name, const std::wstring& path, DWORD pid) {
+    if (!g_protect.enabled) return false;
+    if (IsBlacklisted(name, path)) return false;
+    int level = ProcessIntegrityLevel(pid);
+    if (level < g_protect.min_level) return false;
+    if (g_protect.require_system_dir && !IsSystemDir(path)) return false;
+    if (g_protect.require_signature && !IsSignedFile(path)) return false;
+    return true;
+}
+
 // ============================ 白名单 ============================
 
-// HKLM\SOFTWARE\MemoryGuard\whitelist 下每个值名即白名单 exe 名；另有内置清单
+// HKLM\SOFTWARE\MemoryGuard\whitelist 下每个值名即白名单 exe 名；
+// 另有内置清单与 guard.ini [lists] whitelist（可写 exe 名或目录前缀）。
 static bool IsWhitelisted(const std::wstring& name, const std::wstring& path) {
+    if (ListMatches(g_whitelist, name, path)) return true;
     static const wchar_t* kBuiltIn[] = {
         L"winlogon.exe", L"csrss.exe", L"lsass.exe", L"services.exe",
         L"smss.exe", L"wininit.exe", L"explorer.exe", L"dwm.exe",
@@ -490,6 +713,7 @@ static void ReclaimMemoryPass() {
         CloseHandle(h);
         if (!ok || pmc.WorkingSetSize < 128ull << 20) continue;   // 只动 128MB 以上的大户
         if (pid <= 4 || IsWhitelisted(name, path)) continue;
+        if (IsProtectedProcess(name, path, pid)) continue;        // 安全软件整目录不动
 
         HANDLE hw = OpenProcess(PROCESS_SET_QUOTA, FALSE, pid);
         if (hw) { EmptyWorkingSet(hw); CloseHandle(hw); }
@@ -524,6 +748,7 @@ static bool SelectBadProcess(Victim* out, unsigned long long totalPages) {
         if (!GetProcessMemoryInfo(h, &pmc, sizeof(pmc))) { CloseHandle(h); continue; }
         CloseHandle(h);
         if (pmc.PagefileUsage < kMinVictimWS) continue;
+        if (IsProtectedProcess(name, path, pid)) continue;        // 安全软件整目录不动
 
         long long points = OomBadness(pmc, OomScoreAdjOf(name, path), totalPages);
         if (points == OOM_MIN) continue;
@@ -807,6 +1032,7 @@ static void Out(const wchar_t* fmt, ...) {
 }
 
 static int CmdScore(DWORD pid) {
+    LoadConfig();   // 让 ini 里的白名单/blacklist/adj 在 CLI 查询里同样生效
     HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, FALSE, pid);
     if (!h) { Out(L"找不到进程 %lu\n", pid); return 1; }
     wchar_t wpath[MAX_PATH] = L""; DWORD sz = MAX_PATH;
@@ -836,12 +1062,33 @@ static int CmdScore(DWORD pid) {
 }
 
 static int CmdAdj(DWORD pid, long v) {
+    LoadConfig();
     if (v < -1000 || v > 1000) { Out(L"adj 取值范围 -1000..1000\n"); return 1; }
     std::wstring name, path;
     FillNamePath(pid, &name, &path);
     if (path.empty()) { Out(L"找不到进程 %lu\n", pid); return 1; }
     RegSetAdj(Lower(path), v);
     Out(L"已将 %ls 的 oom_score_adj 设为 %ld\n", path.c_str(), v);
+    return 0;
+}
+
+// 诊断：这个进程会不会被保护规则放过
+static int CmdCheck(DWORD pid) {
+    LoadConfig();
+    std::wstring name, path;
+    FillNamePath(pid, &name, &path);
+    if (path.empty()) { Out(L"找不到进程 %lu\n", pid); return 1; }
+    int lvl = ProcessIntegrityLevel(pid);
+    bool sysdir = IsSystemDir(path);
+    bool signedOk = IsSignedFile(path);
+    bool white = IsWhitelisted(name, path);
+    bool black = IsBlacklisted(name, path);
+    bool prot = IsProtectedProcess(name, path, pid);
+    Out(L"PID %lu：%ls\n路径：%ls\n", pid, name.c_str(), path.c_str());
+    Out(L"完整性级别：%d（0=Medium 1=Administrator 2=System，-1=读不到）\n", lvl);
+    Out(L"系统目录：%s　签名有效：%s\n", sysdir ? L"是" : L"否", signedOk ? L"是" : L"否");
+    Out(L"白名单：%s　黑名单：%s\n", white ? L"是" : L"否", black ? L"是" : L"否");
+    Out(L"受保护（不回收、不击杀）：%s\n", prot ? L"是" : L"否");
     return 0;
 }
 
@@ -852,6 +1099,7 @@ static int Usage() {
     Out(L"  MemoryGuardService.exe --console  前台控制台模式（调试用）\n");
     Out(L"  MemoryGuardService.exe --score <pid>   查看 /proc/<pid>/oom_score 等价信息\n");
     Out(L"  MemoryGuardService.exe --adj <pid> <-1000..1000>  设置 oom_score_adj（持久化）\n");
+    Out(L"  MemoryGuardService.exe --check <pid>   诊断该进程的保护/名单判定\n");
     Out(L"  MemoryGuardService.exe --help     显示本帮助\n");
     Out(L"\n数据目录：C:\\ProgramData\\MemoryGuard\\  (guard.log / kills.csv)\n");
     return 0;
@@ -886,6 +1134,7 @@ int wmain(int argc, wchar_t** argv) {
         return Usage();
 
     if (argc >= 3 && !wcscmp(argv[1], L"--score")) return CmdScore((DWORD)_wtoi(argv[2]));
+    if (argc >= 3 && !wcscmp(argv[1], L"--check")) return CmdCheck((DWORD)_wtoi(argv[2]));
     if (argc >= 4 && !wcscmp(argv[1], L"--adj"))  return CmdAdj((DWORD)_wtoi(argv[2]), wcstol(argv[3], nullptr, 10));
     if (argc >= 2 && !wcscmp(argv[1], L"--console")) return RunConsole();
 

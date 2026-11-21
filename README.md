@@ -22,15 +22,22 @@ MemoryGuard 补上了这块拼图：
 - **完整审计**：`guard.log` 全程记录，`kills.csv` 击杀档案（Excel 可开）
 - **日志轮转**：5MB 自动切 `.old`，不会撑爆磁盘
 - **防误杀**：启动不足 10s 的进程跳过、提交内存 <256MB 不作为候选、关键进程白名单
+- **安全软件保护**：签名 + 系统目录 + 权限档位（默认 System，可配）三者全满足的进程整目录不碰，连温和回收都不做；黑名单可覆盖
+- **黑白名单可配**：`guard.ini` 里按 exe 名或目录前缀配置，白名单永不动、黑名单优先击杀
 - **服务化**：SCM 标准服务，开机自启，`sc` 全套管理
 ## 构建
 需 MinGW-w64（g++）：
 ```bash
 g++ MemoryGuardService.cpp -o MemoryGuardService.exe \
     -std=c++17 -O2 -municode -g3 \
-    -lwtsapi32 -ladvapi32 -luser32 -lpsapi
+    -lwtsapi32 -ladvapi32 -luser32 -lpsapi -lwintrust -lcrypt32
 ```
 ## 部署（管理员 CMD）
+```cmd
+install.cmd      :: 首次安装或升级：拷 exe 到 ProgramData、sc create/start
+uninstall.cmd    :: sc stop + sc delete（配置与日志保留）
+```
+手动等价命令：
 ```cmd
 sc create MemoryGuard binPath= "C:\ProgramData\MemoryGuard\MemoryGuardService.exe" start= auto DisplayName= "MemoryGuard 内存守护"
 sc description MemoryGuard "Windows 内存守护服务：温和回收 + OOM killer（Linux 复刻版）"
@@ -60,6 +67,7 @@ oom_score：195（badness 608764）
 ```cmd
 MemoryGuardService.exe --adj 157200 -1000   :: 豁免：永不被击杀
 MemoryGuardService.exe --adj 157200 500     :: 打压：优先候选
+MemoryGuardService.exe --check 157200       :: 诊断保护/名单判定（签名、目录、完整性、黑白名单）
 MemoryGuardService.exe --console            :: 前台运行，观察实时行为
 ```
 ### 配置（`guard.ini`，改完 `sc stop` + `sc start` 生效）
@@ -79,8 +87,21 @@ group_kill = 1         ; 连带击杀同映像的子进程
 panic_on_oom = 0       ; 0=关 1=服务退出 2=重启系统
 respawn_adj = 500
 victim_wait_ms = 5000
+[protect]
+enabled = 1            ; 1=开启安全软件保护
+min_level = 2          ; 0=Medium 1=Administrator 2=System（默认按 System 起）
+require_signature = 1  ; 必须 Authenticode 验签通过（本地缓存，不联网）
+require_system_dir = 1 ; exe 必须在 windir / Program Files* / ProgramData 下
+dirs =                 ; 追加保护目录，';' 分隔（如 D:\Security\）
+[lists]
+whitelist =            ; exe 名或目录前缀，';' 分隔；永不回收、永不击杀
+blacklist =            ; 同格式；优先击杀，并覆盖 [protect]
 ```
 所有键可省略，缺失回退内置默认；非法值（如 soft ≥ hard）自动纠正并记日志。
+
+**安全软件保护口径**：只有「签名有效 + 在系统目录 + 完整性级别 ≥ `min_level`」三条**同时**成立才跳过；
+默认 `min_level=2`（System），改成 `1` 可把以 Administrator 运行的安全软件也一起放过。
+进程判定可用 `--check <pid>` 直接看。
 ### 日常运维
 ```cmd
 sc query MemoryGuard      :: 状态
